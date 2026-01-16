@@ -59,6 +59,29 @@ pub async fn save_roster(
     Ok(count)
 }
 
+#[derive(Serialize, FromRow)]
+pub struct Student {
+    pub student_id: String,
+    pub name: String,
+    pub email: Option<String>,
+}
+
+#[tauri::command]
+pub async fn list_students(
+    pool: State<'_, DbPool>,
+    course_id: String,
+) -> Result<Vec<Student>, String> {
+    let students = sqlx::query_as::<sqlx::Sqlite, Student>(
+        "SELECT student_id, name, email FROM students WHERE course_id = ? ORDER BY name ASC"
+    )
+    .bind(&course_id)
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    
+    Ok(students)
+}
+
 
 #[tauri::command]
 pub async fn create_course(

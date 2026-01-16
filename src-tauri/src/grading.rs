@@ -299,3 +299,270 @@ pub async fn get_audit_log(
     
     Ok(result)
 }
+
+// --- Session Bookmarks (Enhanced) ---
+
+#[derive(Debug, Serialize)]
+pub struct EnhancedSessionBookmark {
+    pub assignment_id: String,
+    pub submission_id: Option<String>,
+    pub question_index: i32,
+    pub last_saved_at: Option<String>,
+}
+
+/// Save session bookmark with question index
+#[tauri::command]
+pub async fn save_session_bookmark(
+    pool: State<'_, DbPool>,
+    ta_id: String,
+    assignment_id: String,
+    submission_id: String,
+    question_index: i32,
+) -> Result<(), String> {
+    // Upsert into a session_bookmarks table (or use key-value approach)
+    // For simplicity, we'll use the audit log with a special action type
+    // OR we can create a lightweight table. Let's use a simple approach:
+    // Store in submissions.notes as JSON for the TA's last position
+    
+    // Actually, let's just update last_opened_at and store question_index in a simple table
+    // For now, we'll use the existing touch + store question_index in local storage (frontend)
+    // OR we add a new column. Let's add to existing submissions table a simple approach.
+    
+    // Simplest: Store in audit_log with action = "session_bookmark"
+    let details = serde_json::json!({
+        "assignment_id": assignment_id,
+        "submission_id": submission_id,
+        "question_index": question_index
+    }).to_string();
+    
+    log_audit_internal(&pool, Some(&ta_id), "session_bookmark", "session", &assignment_id, Some(&details)).await?;
+    
+    // Also touch the submission
+    sqlx::query("UPDATE submissions SET last_opened_at = CURRENT_TIMESTAMP WHERE id = ?")
+        .bind(&submission_id)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    Ok(())
+}
+
+/// Get last session bookmark for a TA on an assignment
+#[tauri::command]
+pub async fn get_last_session_bookmark(
+    pool: State<'_, DbPool>,
+    ta_id: String,
+    assignment_id: String,
+) -> Result<EnhancedSessionBookmark, String> {
+    // Find the most recent session_bookmark audit entry
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT entity_id, details_json FROM audit_log WHERE ta_id = ? AND action = 'session_bookmark' AND entity_id = ? ORDER BY ts DESC LIMIT 1"
+    )
+    .bind(&ta_id)
+    .bind(&assignment_id)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    
+    if let Some((_entity, details_json)) = row {
+        if let Ok(details) = serde_json::from_str::<serde_json::Value>(&details_json) {
+            return Ok(EnhancedSessionBookmark {
+                assignment_id,
+                submission_id: details["submission_id"].as_str().map(|s| s.to_string()),
+                question_index: details["question_index"].as_i64().unwrap_or(0) as i32,
+                last_saved_at: Some(details_json),
+            });
+        }
+    }
+    
+    // Fallback to basic bookmark
+    let basic = get_session_bookmark(pool.clone(), ta_id, assignment_id.clone()).await?;
+    Ok(EnhancedSessionBookmark {
+        assignment_id,
+        submission_id: basic.submission_id,
+        question_index: 0,
+        last_saved_at: None,
+    })
+}
+
+// --- Unmatched Queue ---
+
+#[derive(Debug, Serialize, FromRow)]
+pub struct UnmatchedSubmission {
+    pub id: String,
+    pub source_zip_path: String,
+    pub folder_path: String,
+    pub received_at: String,
+    pub suggested_student_id: Option<String>,
+}
+
+/// Get all unmatched submissions for an assignment
+#[tauri::command]
+pub async fn get_unmatched_submissions(
+    pool: State<'_, DbPool>,
+    assignment_id: String,
+) -> Result<Vec<UnmatchedSubmission>, String> {
+    let items = sqlx::query_as::<sqlx::Sqlite, UnmatchedSubmission>(
+        r#"
+        SELECT id, source_zip_path, folder_path, received_at, NULL as suggested_student_id
+        FROM submissions 
+        WHERE assignment_id = ? AND student_id IS NULL
+        ORDER BY received_at ASC
+        "#
+    )
+    .bind(&assignment_id)
+    .fetch_all(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    
+    Ok(items)
+}
+
+/// Manually match a submission to a student
+#[tauri::command]
+pub async fn manual_match_submission(
+    pool: State<'_, DbPool>,
+    submission_id: String,
+    student_id: String,
+    ta_id: String,
+) -> Result<(), String> {
+    // Verify student exists
+    let course_id: Option<String> = sqlx::query_scalar(
+        "SELECT a.course_id FROM submissions s JOIN assignments a ON s.assignment_id = a.id WHERE s.id = ?"
+    )
+    .bind(&submission_id)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    
+    let cid = course_id.ok_or("Submission not found")?;
+    
+    let student_exists: bool = sqlx::query_scalar::<sqlx::Sqlite, i32>(
+        "SELECT 1 FROM students WHERE course_id = ? AND student_id = ?"
+    )
+    .bind(&cid)
+    .bind(&student_id)
+    .fetch_optional(&*pool)
+    .await
+    .map_err(|e| e.to_string())?
+    .is_some();
+    
+    if !student_exists {
+        return Err(format!("Student {} not found in roster", student_id));
+    }
+    
+    // Update submission
+    sqlx::query("UPDATE submissions SET student_id = ?, match_method = 'manual', match_confidence = 1.0 WHERE id = ?")
+        .bind(&student_id)
+        .bind(&submission_id)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    // Log audit
+    let details = serde_json::json!({ "student_id": student_id }).to_string();
+    log_audit_internal(&pool, Some(&ta_id), "manual_match", "submission", &submission_id, Some(&details)).await?;
+    
+    Ok(())
+}
+
+/// Skip/quarantine a submission that cannot be matched
+#[tauri::command]
+pub async fn quarantine_submission(
+    pool: State<'_, DbPool>,
+    submission_id: String,
+    reason: String,
+    ta_id: String,
+) -> Result<(), String> {
+    sqlx::query("UPDATE submissions SET status = 'error', notes = ? WHERE id = ?")
+        .bind(&reason)
+        .bind(&submission_id)
+        .execute(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    let details = serde_json::json!({ "reason": reason }).to_string();
+    log_audit_internal(&pool, Some(&ta_id), "quarantine", "submission", &submission_id, Some(&details)).await?;
+    
+    Ok(())
+}
+
+// --- Corrupt ZIP Detection ---
+
+#[derive(Debug, Serialize)]
+pub struct ZipValidationResult {
+    pub is_valid: bool,
+    pub file_count: usize,
+    pub total_size: u64,
+    pub is_zip_bomb: bool,
+    pub error_message: Option<String>,
+}
+
+/// Validate a ZIP file before processing
+#[tauri::command]
+pub async fn validate_zip(
+    file_path: String,
+) -> Result<ZipValidationResult, String> {
+    use std::fs::File;
+    use zip::ZipArchive;
+    
+    let path = std::path::Path::new(&file_path);
+    if !path.exists() {
+        return Ok(ZipValidationResult {
+            is_valid: false,
+            file_count: 0,
+            total_size: 0,
+            is_zip_bomb: false,
+            error_message: Some("File not found".to_string()),
+        });
+    }
+    
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Ok(ZipValidationResult {
+            is_valid: false,
+            file_count: 0,
+            total_size: 0,
+            is_zip_bomb: false,
+            error_message: Some(format!("Cannot open file: {}", e)),
+        }),
+    };
+    
+    let mut archive = match ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(e) => return Ok(ZipValidationResult {
+            is_valid: false,
+            file_count: 0,
+            total_size: 0,
+            is_zip_bomb: false,
+            error_message: Some(format!("Invalid ZIP: {}", e)),
+        }),
+    };
+    
+    let file_count = archive.len();
+    let mut total_size = 0u64;
+    let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(1);
+    
+    for i in 0..archive.len() {
+        if let Ok(file) = archive.by_index_raw(i) {
+            total_size += file.size();
+        }
+    }
+    
+    // Zip bomb detection: ratio of uncompressed to compressed > 100x is suspicious
+    let ratio = total_size as f64 / compressed_size as f64;
+    let is_zip_bomb = ratio > 100.0 || total_size > 1_000_000_000; // 1GB limit
+    
+    Ok(ZipValidationResult {
+        is_valid: !is_zip_bomb,
+        file_count,
+        total_size,
+        is_zip_bomb,
+        error_message: if is_zip_bomb { 
+            Some(format!("Potential zip bomb detected (compression ratio: {:.1}x)", ratio)) 
+        } else { 
+            None 
+        },
+    })
+}
+

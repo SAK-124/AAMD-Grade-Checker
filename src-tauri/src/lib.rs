@@ -33,6 +33,7 @@ pub fn run() {
             commands::create_ta,
             commands::list_tas,
             commands::save_roster,
+            commands::list_students,
             // Assignments
             commands::create_assignment,
             commands::list_assignments,
@@ -54,6 +55,12 @@ pub fn run() {
             grading::touch_submission,
             grading::log_audit,
             grading::get_audit_log,
+            grading::save_session_bookmark,
+            grading::get_last_session_bookmark,
+            grading::get_unmatched_submissions,
+            grading::manual_match_submission,
+            grading::quarantine_submission,
+            grading::validate_zip,
             // Excel
             excel::analyze_excel,
             excel::generate_excel_pdf,
