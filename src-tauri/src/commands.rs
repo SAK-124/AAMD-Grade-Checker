@@ -342,3 +342,25 @@ pub async fn get_grades(
     .map_err(|e| e.to_string())?;
     Ok(grades)
 }
+
+/// Read a file's content from a submission
+#[tauri::command]
+pub async fn read_submission_file(
+    pool: State<'_, DbPool>,
+    submission_id: String,
+    file_path: String,
+) -> Result<String, String> {
+    let folder_path: String = sqlx::query_scalar("SELECT folder_path FROM submissions WHERE id = ?")
+        .bind(&submission_id)
+        .fetch_one(&*pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    
+    let full_path = std::path::Path::new(&folder_path).join(&file_path);
+    
+    if !full_path.exists() {
+        return Err("File not found".to_string());
+    }
+    
+    std::fs::read_to_string(&full_path).map_err(|e| e.to_string())
+}
